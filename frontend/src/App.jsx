@@ -4,8 +4,9 @@ import PlotMap from "./components/PlotMap.jsx";
 import PlotDetail from "./components/PlotDetail.jsx";
 import ConflictsWorkbench from "./components/ConflictsWorkbench.jsx";
 import EstimatePanel from "./components/EstimatePanel.jsx";
+import BatchSyncPanel from "./components/BatchSyncPanel.jsx";
 
-const TABS = ["map", "conflicts", "estimates"];
+const TABS = ["map", "batches", "conflicts", "estimates"];
 
 export default function App() {
   const [tab, setTab] = useState("map");
@@ -81,6 +82,7 @@ export default function App() {
           <button key={t} className={tab === t ? "tab active" : "tab"}
                   onClick={() => setTab(t)}>
             {t === "map" ? "Plots & individuals"
+              : t === "batches" ? "Batch sync"
               : t === "conflicts" ? `Identity conflicts (${conflicts.length})`
               : "Estimates"}
           </button>
@@ -94,6 +96,7 @@ export default function App() {
                           onBack={() => setSelectedPlot(null)} />
             : <PlotMap ctx={ctx} onSelect={setSelectedPlot} />
         )}
+        {tab === "batches" && <BatchSyncPanel ctx={ctx} />}
         {tab === "conflicts" && (
           <ConflictsWorkbench ctx={ctx}
                               onChanged={async () => {

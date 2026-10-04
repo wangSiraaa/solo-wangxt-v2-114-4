@@ -99,6 +99,36 @@ pre { background: #f2f5f2; border-radius: 6px; padding: 8px; font-size: 11px;
   border-radius: 10px; padding: 2px 9px; font-size: 11px; margin: 2px 4px 2px 0; }
 .assumptions { font-size: 12px; color: #37473d; padding-left: 18px; }
 .assumptions li { margin-bottom: 5px; }
+
+/* survey batch sync */
+.batch-form { display: grid; gap: 8px; max-width: 640px; }
+.batch-form label { display: grid; gap: 4px; font-size: 12px;
+  color: var(--muted); }
+.batch-form input, .batch-form select, .batch-form textarea {
+  border: 1px solid var(--line); border-radius: 6px; padding: 7px 9px;
+  font-size: 13px; font-family: inherit; background: #fff; color: var(--ink); }
+.batch-form textarea { font-family: ui-monospace, monospace; font-size: 12px; }
+.progress-bar { position: relative; background: #eef3ef;
+  border: 1px solid var(--line); border-radius: 8px; height: 18px;
+  min-width: 140px; overflow: hidden; }
+.progress-fill { position: absolute; inset: 0 auto 0 0;
+  background: #bfe0c6; }
+.progress-bar span { position: relative; display: block; text-align: center;
+  font-size: 11px; line-height: 18px; color: var(--ink); }
+.batch-staged, .batch-validated { color: #9a6b00; font-weight: 600; }
+.batch-applied { color: var(--green); font-weight: 600; }
+.batch-blocked { color: var(--red); font-weight: 600; }
+.batch-failed { color: var(--red); font-weight: 600; }
+.batch-discarded { color: var(--muted); }
+.badge.batch-applied { background: #e7f6e9; }
+.badge.batch-blocked, .badge.batch-failed { background: #fdecec; }
+.badge.batch-staged, .badge.batch-validated { background: #fdf3dd;
+  color: #9a6b00; }
+.blocked-card { background: #fff; border: 1px solid #e4b3b3;
+  border-radius: 10px; padding: 10px 14px; margin: 8px 0; }
+.blocked-card .chip { margin-left: 8px; }
+.blocked-card table { margin: 8px 0; }
+
 footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
 @media (max-width: 900px) {
   .detail-grid, .two-col { grid-template-columns: 1fr; }

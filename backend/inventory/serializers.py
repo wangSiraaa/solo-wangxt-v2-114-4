@@ -5,6 +5,7 @@ from inventory.models import (
     Campaign,
     EstimateVersion,
     IdentityConflict,
+    ImportBatch,
     Plot,
     Species,
     Stratum,
@@ -149,3 +150,45 @@ class MeasurementImportRowSerializer(serializers.Serializer):
 class MeasurementImportSerializer(serializers.Serializer):
     campaign = serializers.CharField()
     rows = MeasurementImportRowSerializer(many=True)
+
+
+class BatchSubmitSerializer(serializers.Serializer):
+    """One survey batch uploaded by a field tablet."""
+
+    campaign = serializers.CharField()
+    client_key = serializers.CharField(max_length=64)
+    rows = MeasurementImportRowSerializer(many=True)
+
+    def validate_client_key(self, value):
+        if not value.strip():
+            raise serializers.ValidationError("client_key must not be blank")
+        return value
+
+
+class BatchSerializer(serializers.ModelSerializer):
+    """Batch summary for lists and progress views (no row payloads)."""
+
+    campaign_code = serializers.CharField(source="campaign.code",
+                                          read_only=True)
+
+    class Meta:
+        model = ImportBatch
+        fields = [
+            "id", "campaign", "campaign_code", "client_key", "content_hash",
+            "status", "n_rows", "n_applied", "error", "resolution_note",
+            "created_at", "updated_at", "applied_at", "resolved_at",
+        ]
+
+
+class BatchDetailSerializer(BatchSerializer):
+    """Full batch detail: per-row receipts and (if blocked) overlaps."""
+
+    class Meta(BatchSerializer.Meta):
+        fields = BatchSerializer.Meta.fields + ["receipt", "overlaps"]
+
+
+class BatchResolveSerializer(serializers.Serializer):
+    # A later batch may NEVER overwrite first-arrived data; the only
+    # human decision is to discard the blocked batch.
+    decision = serializers.ChoiceField(choices=["discard"])
+    note = serializers.CharField(required=False, allow_blank=True)

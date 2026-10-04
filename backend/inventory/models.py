@@ -69,6 +69,25 @@ VERSION_STATUS_CHOICES = [
     (VERSION_SUPERSEDED, "Superseded by a newer confirmed version"),
 ]
 
+# Survey-batch sync lifecycle. A batch is staged on arrival, validated as a
+# whole (nothing is written row-by-row), then applied atomically. Batches
+# that overlap already-applied tree records are blocked for HUMAN handling —
+# a later batch never overwrites first-arrived data.
+BATCH_STAGED = "staged"
+BATCH_VALIDATED = "validated"
+BATCH_APPLIED = "applied"
+BATCH_BLOCKED = "blocked"
+BATCH_FAILED = "failed"
+BATCH_DISCARDED = "discarded"
+BATCH_STATUS_CHOICES = [
+    (BATCH_STAGED, "Staged — received, awaiting validation (retryable)"),
+    (BATCH_VALIDATED, "Validated — awaiting atomic apply (retryable)"),
+    (BATCH_APPLIED, "Applied — measurements written atomically"),
+    (BATCH_BLOCKED, "Blocked — overlaps applied data, needs human review"),
+    (BATCH_FAILED, "Failed — row validation errors, not applied"),
+    (BATCH_DISCARDED, "Discarded by reviewer — first-arrived data kept"),
+]
+
 
 class Stratum(models.Model):
     """Sampling stratum with known land area (the sampling frame)."""
@@ -281,6 +300,15 @@ class TreeMeasurement(models.Model):
     height_m = models.FloatField(null=True, blank=True)
 
     notes = models.CharField(max_length=240, blank=True)
+    source_batch = models.ForeignKey(
+        "ImportBatch",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="measurements",
+        help_text="Survey batch that wrote this measurement (null for the "
+                  "legacy single-shot import).",
+    )
 
     class Meta:
         unique_together = [("tree", "campaign")]
@@ -327,6 +355,74 @@ class IdentityConflict(models.Model):
         return f"{self.plot.code}/{self.field_number}: {self.status}"
 
 
+class ImportBatch(models.Model):
+    """
+    One resumable upload batch from a field tablet.
+
+    The tablet splits a survey into batches and may re-send them in any
+    order (or twice, when the network flaps). ``client_key`` is the
+    tablet's idempotency key: re-sending the same key with the same
+    content returns the stored receipt and writes nothing; the same key
+    with different content is rejected outright.
+
+    Lifecycle: staged -> validated -> applied | blocked | failed
+    (+ discarded after human review of a blocked batch).
+
+    Nothing reaches TreeMeasurement until EVERY row validates; the apply
+    step is a single transaction, so an interrupted batch can simply be
+    resumed — it never leaves partial measurements behind.
+    """
+
+    campaign = models.ForeignKey(
+        Campaign, on_delete=models.PROTECT, related_name="import_batches"
+    )
+    client_key = models.CharField(
+        max_length=64,
+        help_text="Client-generated idempotency key (unique per campaign).",
+    )
+    content_hash = models.CharField(
+        max_length=64,
+        help_text="SHA-256 of the canonicalised row payload.",
+    )
+    status = models.CharField(
+        max_length=12, choices=BATCH_STATUS_CHOICES, default=BATCH_STAGED
+    )
+    payload = models.JSONField(
+        help_text="Raw rows as received — kept so an interrupted batch can "
+                  "be resumed without the client re-sending.",
+    )
+    receipt = models.JSONField(
+        null=True, blank=True,
+        help_text="Per-row receipts (accepted/rejected + reason + ids), "
+                  "returned verbatim on idempotent replay.",
+    )
+    overlaps = models.JSONField(
+        null=True, blank=True,
+        help_text="Rows overlapping already-applied tree records; shown to "
+                  "a human reviewer when the batch is blocked.",
+    )
+    n_rows = models.IntegerField(default=0)
+    n_applied = models.IntegerField(default=0)
+    error = models.CharField(max_length=300, blank=True)
+    resolution_note = models.CharField(max_length=240, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["campaign", "client_key"],
+                name="unique_batch_client_key_per_campaign",
+            )
+        ]
+
+    def __str__(self):
+        return f"batch {self.client_key}@{self.campaign.code} [{self.status}]"
+
+
 class MeasurementImportRow(models.Model):
     """Audit trail for raw imported rows, including rejected ones."""
 
@@ -335,6 +431,15 @@ class MeasurementImportRow(models.Model):
     )
     plot = models.ForeignKey(
         Plot, on_delete=models.PROTECT, related_name="import_rows"
+    )
+    batch = models.ForeignKey(
+        ImportBatch,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="audit_rows",
+        help_text="Set when the row arrived via a survey batch; null for "
+                  "the legacy single-shot import.",
     )
     raw_payload = models.JSONField()
     accepted = models.BooleanField()

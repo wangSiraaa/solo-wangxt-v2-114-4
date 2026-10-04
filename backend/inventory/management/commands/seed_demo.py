@@ -163,11 +163,11 @@ class Command(BaseCommand):
     @transaction.atomic
     def handle(self, *args, **options):
         from inventory.models import (
-            EstimateVersion, IdentityConflict, MeasurementImportRow,
-            Tree, TreeMeasurement,
+            EstimateVersion, IdentityConflict, ImportBatch,
+            MeasurementImportRow, Tree, TreeMeasurement,
         )
         models = [EstimateVersion, IdentityConflict, MeasurementImportRow,
-                  TreeMeasurement, Tree, Plot, Campaign,
+                  ImportBatch, TreeMeasurement, Tree, Plot, Campaign,
                   AllometricEquation, Species, Stratum]
         for m in models:
             m.objects.all().delete()

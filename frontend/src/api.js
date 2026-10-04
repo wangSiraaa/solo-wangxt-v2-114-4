@@ -31,4 +31,11 @@ export const api = {
   estimate: (id) => get(`/estimates/${id}/`),
   createEstimate: (payload) => post("/estimates/", payload),
   confirmEstimate: (id) => post(`/estimates/${id}/confirm/`),
+  batches: (query) => get(`/batches/${query ? `?${query}` : ""}`),
+  batch: (id) => get(`/batches/${id}/`),
+  submitBatch: (payload) => post("/batches/", payload),
+  applyBatch: (id) => post(`/batches/${id}/apply/`),
+  resolveBatch: (id, payload) => post(`/batches/${id}/resolve/`, payload),
+  batchProgress: () => get("/batches/progress/"),
+  batchConflicts: () => get("/batches/conflicts/"),
 };

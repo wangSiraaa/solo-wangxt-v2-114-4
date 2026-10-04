@@ -71,6 +71,22 @@ Y = Σ_h Y_h，SE 跨层合成（Welch–Satterthwaite 自由度，t 分布 95% 
 * 确认时同时**锁定所用方程**（系数不可改）；新系数必须以**新方程 code/version** 录入，
   并产生**新版本估计**，旧版本数字永不改变。
 
+### 1.7 离线平板的分批调查同步（可恢复、幂等）
+野外平板无网时把一次调查拆成多批，可能乱序（2024 批先于 2019 批到达）或在网络恢复时重发：
+
+* 每批携带平板端**幂等键** `client_key` 与行载荷的 **SHA-256 内容摘要**；
+  状态机 `staged → validated → applied / blocked / failed`（人工处理后有 `discarded`）。
+* **整批校验、整批原子写入**：所有行通过后才在一个事务里写入测量与审计行；
+  事务中断只回滚，刷新后批次处于可重试状态（staged/validated），重试不留部分测量。
+* **同键同载荷重发** → 原样返回已存回执，零写入；**同键不同载荷** → 409 拒绝。
+* **重叠树记录**（同树、同 campaign）→ 批次 `blocked` 进入人工处理；
+  先到数据永不被后到批次覆盖，人工只能 `discard` 后到批次。
+* `MeasurementImportRow` 审计行带 `batch` 外键：校验失败的行在应用前即可查，
+  应用后 accepted 行同样可按批查询。
+* **死亡、进界、身份冲突只在相邻调查数据齐备后计算**：某样地只有一侧调查数据时，
+  其行在估计中挂起（`provenance.pending_adjacent_data`），不会提前造出死亡或进界；
+  身份冲突扫描也仅在两个相邻 campaign 都有已应用测量后才运行。
+
 ---
 
 ## 2. 不确定性假设（结果中完整输出）
@@ -84,6 +100,8 @@ Y = Σ_h Y_h，SE 跨层合成（Welch–Satterthwaite 自由度，t 分布 95% 
 5. 未核实身份、未找到、进界以下个体**排除在分量外**并在 provenance 列明。
 6. 95% CI 用跨层 Welch–Satterthwaite df 的 t 分布；净变化 SE 中分量抽样协方差假定为 0。
 7. 样地申报面积与多边形面积交叉核对（1% 容差）。
+8. 死亡、进界与身份冲突只在相邻调查批次全部应用后计算；仅有一侧数据的样地挂起在
+   `provenance.pending_adjacent_data`，暂不计入这些分量。
 
 ---
 
@@ -113,11 +131,13 @@ npm install
 npm run dev          # http://localhost:5173, /api 代理到 8123
 ```
 
-界面三页：
+界面四页：
 1. **Plots & individuals**：SVG 地图显示全部样地边界与 t2 个体状态；点入样地看 t1→t2 复测、
    改号、零生长/缺测/死亡着色；
-2. **Identity conflicts**：编号矛盾核实工作台（renumber / distinct）；
-3. **Estimates**：选择方程→跑 draft→查看分量、来源、不确定性→确认冻结。
+2. **Batch sync**：批次提交（campaign + 幂等键 + 行 JSON）、逐行回执、上传进度条、
+   可重试批次的“resume apply”、blocked 批次人工处理队列（只能 discard）；
+3. **Identity conflicts**：编号矛盾核实工作台（renumber / distinct）；
+4. **Estimates**：选择方程→跑 draft→查看分量、来源、不确定性→确认冻结。
 
 ---
 
@@ -130,6 +150,11 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 | GET | `/api/conflicts/?status=open` | 同号位置矛盾 |
 | POST | `/api/conflicts/{id}/resolve/` | `{status: renumber|distinct, note}` |
 | POST | `/api/imports/` | 批量入库（拒收单位错误/越界行，207 返回明细） |
+| POST | `/api/batches/` | 提交调查批次（幂等；201 应用 / 200 重放 / 202 blocked / 207 行错误 / 409 键冲突） |
+| GET | `/api/batches/`、`/api/batches/{id}/` | 批次列表与逐行回执详情 |
+| POST | `/api/batches/{id}/apply/` | 继续应用被中断的批次（幂等重试） |
+| POST | `/api/batches/{id}/resolve/` | blocked 批次人工处理（仅 `discard`，先到数据保留） |
+| GET | `/api/batches/progress/`、`/api/batches/conflicts/` | 各 campaign 上传进度 / 待人工处理队列 |
 | POST | `/api/estimates/` | 运行 draft 估计 |
 | POST | `/api/estimates/{id}/confirm/` | 冻结版本并锁定方程 |
 | GET | `/api/estimates/{id}/` | 完整结果：分量 + 来源 + 不确定性 |
@@ -148,14 +173,33 @@ npm run dev          # http://localhost:5173, /api 代理到 8123
 }
 ```
 
+### 批次提交示例
+```json
+{
+  "campaign": "2024",
+  "client_key": "tablet-07-batch-003",
+  "rows": [{
+    "plot": "P01", "field_number": "001", "species": "OAK",
+    "x_m": 500010.0, "y_m": 4000010.0,
+    "status": "alive_measured",
+    "dbh_raw": 252, "dbh_unit": "mm",
+    "height_raw": 16.8, "height_unit": "m"
+  }]
+}
+```
+
 ---
 
 ## 5. 验收测试
 ```bash
 cd backend && python3 manage.py test inventory
 ```
-12 个测试覆盖：改号、同号位置矛盾（剔除→核实 distinct 后才入死亡/进界）、
-不等面积按样地扩展、单位错误拒收、零生长/缺测/死亡区分、已确认版本对新方程与直接篡改免疫。
+21 个测试覆盖：改号、同号位置矛盾（剔除→核实 distinct 后才入死亡/进界）、
+不等面积按样地扩展、单位错误拒收、零生长/缺测/死亡区分、已确认版本对新方程与直接篡改免疫，
+以及批次同步：多批合并=一次完整导入+一次冲突扫描、同键同载荷重发放回原回执零写入、
+同键不同载荷 409、重叠树记录 blocked 且先到数据不被覆盖、批内重复编号拒收、
+先到 2024 批不提前产生死亡/进界/身份冲突、事务中断后可重试且不留部分测量或双重冲突、
+中断批次重发即续传、逐批审计与进度可查。
 
 ## 6. 虚构演示数据场景索引
 * `P01/004` 两次胸径相同 → **真实零生长**；

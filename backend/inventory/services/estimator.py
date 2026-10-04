@@ -435,6 +435,22 @@ def estimate(table_t1, table_t2, equations, plots, strata, design,
         resolved_distinct_pairs=resolved_distinct_pairs,
     )
 
+    # Adjacent-survey gating: mortality, ingrowth and identity conflicts
+    # are computed ONLY for plots whose data are complete at both
+    # occasions. A plot uploaded for t2 but not yet for t1 (offline
+    # tablets sync in batches, possibly out of order) must not
+    # manufacture premature "deaths" or "ingrowth"; its rows are held
+    # and listed in provenance until the adjacent survey arrives.
+    plots_t1 = {r["plot"] for r in table_t1}
+    plots_t2 = {r["plot"] for r in table_t2}
+    complete_plots = plots_t1 & plots_t2
+    held_t1 = [r for r in pairing["t1_only"] if r["plot"] not in complete_plots]
+    held_t2 = [r for r in pairing["t2_only"] if r["plot"] not in complete_plots]
+    pairing["t1_only"] = [r for r in pairing["t1_only"]
+                          if r["plot"] in complete_plots]
+    pairing["t2_only"] = [r for r in pairing["t2_only"]
+                          if r["plot"] in complete_plots]
+
     pcs = [
         compute_plot_components(
             code, info, pairing, equations,
@@ -599,6 +615,18 @@ def estimate(table_t1, table_t2, equations, plots, strata, design,
              "hint": c.get("hint", "same_number_position_mismatch")}
             for c in pairing["conflicts"]
         ],
+        "pending_adjacent_data": {
+            "plots": sorted(plots_t1 ^ plots_t2),
+            "held_t1_rows": [
+                {"plot": r["plot"], "field_number": r["field_number"]}
+                for r in held_t1],
+            "held_t2_rows": [
+                {"plot": r["plot"], "field_number": r["field_number"]}
+                for r in held_t2],
+            "note": "plots present at only one occasion; mortality, "
+                    "ingrowth and identity conflicts are deferred until "
+                    "the adjacent survey's batches have been applied",
+        },
         "plots": [_pc_provenance(pc) for pc in pcs],
     }
 
@@ -690,6 +718,11 @@ def _assumptions(design):
         "Trees under recruitment dbh are recorded but excluded from "
         "ingrowth; trees not located and unverified identity pairs are "
         "excluded from ALL components and listed under provenance.",
+        "Mortality, ingrowth and identity conflicts are computed only "
+        "for plots whose adjacent-occasion batches have ALL been "
+        "applied; plots still waiting for the other survey are held "
+        "under provenance.pending_adjacent_data and contribute nothing "
+        "to those components yet.",
         "95% CI uses Welch-Satterthwaite degrees of freedom across strata "
         "and the t distribution; component sampling covariances are "
         "assumed zero in the net-change SE.",

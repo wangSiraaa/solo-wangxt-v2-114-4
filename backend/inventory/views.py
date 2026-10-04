@@ -5,7 +5,14 @@ GET  /plots/                        plot positions + boundaries (React map)
 GET  /trees/?campaign=CODE          individuals and remeasurement status
 GET  /conflicts/                    same-number position contradictions
 POST /conflicts/{id}/resolve/       human verification only
-POST /imports/                      ingest a campaign's field rows
+POST /imports/                      ingest a campaign's field rows (legacy)
+POST /batches/                      submit a resumable survey batch
+GET  /batches/                      batch list (?campaign=, ?status=)
+GET  /batches/{id}/                 batch detail with per-row receipts
+POST /batches/{id}/apply/           resume/continue an interrupted batch
+POST /batches/{id}/resolve/         human handling of a blocked batch
+GET  /batches/progress/             per-campaign upload progress
+GET  /batches/conflicts/            blocked batches awaiting review
 POST /estimates/                    run (or rerun) a DRAFT estimate
 POST /estimates/{id}/confirm/       freeze forever; locks equations
 GET  /estimates/{id}/               frozen result with provenance
@@ -21,12 +28,16 @@ from rest_framework.response import Response
 
 from inventory.models import (
     AllometricEquation,
+    BATCH_APPLIED,
+    BATCH_BLOCKED,
+    BATCH_FAILED,
     Campaign,
     CONFLICT_DISTINCT,
     CONFLICT_OPEN,
     CONFLICT_RENUMBER,
     EstimateVersion,
     IdentityConflict,
+    ImportBatch,
     Plot,
     Species,
     Stratum,
@@ -35,6 +46,10 @@ from inventory.models import (
     VERSION_CONFIRMED,
 )
 from inventory.serializers import (
+    BatchDetailSerializer,
+    BatchResolveSerializer,
+    BatchSerializer,
+    BatchSubmitSerializer,
     CampaignSerializer,
     ConflictResolveSerializer,
     ConflictSerializer,
@@ -46,6 +61,14 @@ from inventory.serializers import (
     SpeciesSerializer,
     StratumSerializer,
     TreeSerializer,
+)
+from inventory.services.batches import (
+    apply_batch,
+    BatchKeyReuseError,
+    BatchStateError,
+    campaign_progress,
+    resolve_batch,
+    submit_batch,
 )
 from inventory.services.conflicts import scan_conflicts
 from inventory.services.estimator import (
@@ -176,6 +199,114 @@ class ImportViewSet(viewsets.ViewSet):
         return Response(result,
                         status=status.HTTP_207_MULTI_STATUS if result["rejected"]
                         else status.HTTP_200_OK)
+
+
+class BatchViewSet(viewsets.ViewSet):
+    """
+    Resumable survey-batch sync for offline field tablets.
+
+    Submit is idempotent on (campaign, client_key): identical replays get
+    the stored receipt back, diverging payloads get 409. Batches that
+    overlap first-arrived data are blocked for human review, never
+    auto-merged.
+    """
+
+    def list(self, request):
+        qs = ImportBatch.objects.select_related("campaign").order_by("-id")
+        campaign = request.query_params.get("campaign")
+        if campaign:
+            qs = qs.filter(campaign__code=campaign)
+        state = request.query_params.get("status")
+        if state:
+            qs = qs.filter(status=state)
+        return Response(BatchSerializer(qs, many=True).data)
+
+    def retrieve(self, request, pk=None):
+        return Response(BatchDetailSerializer(_get_batch(pk)).data)
+
+    def create(self, request):
+        ser = BatchSubmitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        campaign = Campaign.objects.filter(
+            code=ser.validated_data["campaign"]).first()
+        if campaign is None:
+            return Response({"detail": "unknown campaign"},
+                            status=status.HTTP_404_NOT_FOUND)
+        try:
+            batch, replayed = submit_batch(
+                campaign,
+                ser.validated_data["client_key"],
+                ser.validated_data["rows"],
+                area_tolerance=settings.PLOT_AREA_TOLERANCE,
+            )
+        except BatchKeyReuseError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        return self._respond(batch, replayed=replayed)
+
+    @action(detail=True, methods=["post"])
+    def apply(self, request, pk=None):
+        """Resume an interrupted (staged/validated) batch. Idempotent."""
+        batch = _get_batch(pk)
+        was_applied = batch.status == BATCH_APPLIED
+        try:
+            apply_batch(batch, area_tolerance=settings.PLOT_AREA_TOLERANCE)
+        except BatchStateError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        return self._respond(batch, replayed=was_applied)
+
+    @action(detail=True, methods=["post"])
+    def resolve(self, request, pk=None):
+        """Human handling of a blocked batch (discard only)."""
+        batch = _get_batch(pk)
+        ser = BatchResolveSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        try:
+            resolve_batch(batch, ser.validated_data["decision"],
+                          ser.validated_data.get("note", ""))
+        except BatchStateError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        return Response(BatchDetailSerializer(batch).data)
+
+    @action(detail=False, methods=["get"])
+    def progress(self, request):
+        """Per-campaign upload progress for the dashboard."""
+        return Response(campaign_progress())
+
+    @action(detail=False, methods=["get"])
+    def conflicts(self, request):
+        """Blocked batches with their overlapping rows, for human review."""
+        qs = (ImportBatch.objects.filter(status=BATCH_BLOCKED)
+              .select_related("campaign").order_by("id"))
+        return Response(BatchDetailSerializer(qs, many=True).data)
+
+    @staticmethod
+    def _respond(batch, replayed):
+        body = {
+            "batch": BatchDetailSerializer(batch).data,
+            "receipt": batch.receipt,
+            "replayed": replayed,
+            "conflicts": (batch.receipt or {}).get("conflicts", []),
+        }
+        if replayed:
+            http = status.HTTP_200_OK
+        elif batch.status == BATCH_APPLIED:
+            http = status.HTTP_201_CREATED
+        elif batch.status == BATCH_BLOCKED:
+            http = status.HTTP_202_ACCEPTED
+        elif batch.status == BATCH_FAILED:
+            http = status.HTTP_207_MULTI_STATUS
+        else:
+            http = status.HTTP_200_OK
+        return Response(body, status=http)
+
+
+def _get_batch(pk):
+    from django.shortcuts import get_object_or_404
+    return get_object_or_404(
+        ImportBatch.objects.select_related("campaign"), pk=pk)
 
 
 class EstimateViewSet(viewsets.ViewSet):
