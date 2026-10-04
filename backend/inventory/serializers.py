@@ -2,12 +2,16 @@ from rest_framework import serializers
 
 from inventory.models import (
     AllometricEquation,
+    BatchConflict,
     Campaign,
     EstimateVersion,
     IdentityConflict,
+    MeasurementImportRow,
     Plot,
     Species,
     Stratum,
+    Survey,
+    SurveyBatch,
     Tree,
     TreeMeasurement,
 )
@@ -149,3 +153,140 @@ class MeasurementImportRowSerializer(serializers.Serializer):
 class MeasurementImportSerializer(serializers.Serializer):
     campaign = serializers.CharField()
     rows = MeasurementImportRowSerializer(many=True)
+
+
+# ------------------------------------------------------------- batch sync
+class BatchSubmitSerializer(serializers.Serializer):
+    """One survey batch uploaded by a field tablet."""
+
+    campaign = serializers.CharField()
+    survey = serializers.CharField(
+        help_text="Client-side survey identifier shared by all batches "
+                  "of this survey.")
+    idempotency_key = serializers.CharField(
+        max_length=80,
+        help_text="Client-generated unique key; retransmission with the "
+                  "same key and payload returns the stored receipt.")
+    expected_batches = serializers.IntegerField(
+        required=False, allow_null=True, min_value=1,
+        help_text="Total number of batches this survey will arrive in.")
+    client_meta = serializers.DictField(required=False)
+    rows = MeasurementImportRowSerializer(many=True)
+
+
+class SurveySerializer(serializers.ModelSerializer):
+    campaign_code = serializers.CharField(source="campaign.code",
+                                          read_only=True)
+    n_batches = serializers.SerializerMethodField()
+    n_applied = serializers.SerializerMethodField()
+    n_blocked = serializers.SerializerMethodField()
+    n_failed = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Survey
+        fields = [
+            "id", "code", "campaign", "campaign_code", "expected_batches",
+            "status", "finalized_at", "created_at",
+            "n_batches", "n_applied", "n_blocked", "n_failed",
+        ]
+
+    def _count(self, obj, status):
+        return obj.batches.filter(status=status).count()
+
+    def get_n_batches(self, obj):
+        return obj.batches.count()
+
+    def get_n_applied(self, obj):
+        return self._count(obj, "applied")
+
+    def get_n_blocked(self, obj):
+        return self._count(obj, "blocked")
+
+    def get_n_failed(self, obj):
+        return self._count(obj, "failed")
+
+
+class SurveyBatchSerializer(serializers.ModelSerializer):
+    survey_code = serializers.CharField(source="survey.code", read_only=True)
+    campaign_code = serializers.CharField(source="campaign.code",
+                                          read_only=True)
+    retryable = serializers.SerializerMethodField()
+
+    class Meta:
+        model = SurveyBatch
+        fields = [
+            "id", "survey", "survey_code", "campaign", "campaign_code",
+            "idempotency_key", "content_digest", "status", "row_count",
+            "client_meta", "error", "attempt_count", "retryable",
+            "created_at", "updated_at", "applied_at",
+        ]
+
+    def get_retryable(self, obj):
+        return obj.status in ("staged", "validated")
+
+
+class SurveyBatchDetailSerializer(SurveyBatchSerializer):
+    receipt = serializers.SerializerMethodField()
+    conflicts = serializers.SerializerMethodField()
+
+    class Meta(SurveyBatchSerializer.Meta):
+        fields = SurveyBatchSerializer.Meta.fields + [
+            "receipt", "conflicts",
+        ]
+
+    def get_receipt(self, obj):
+        from inventory.services.batches import build_receipt
+        return obj.receipt or build_receipt(obj)
+
+    def get_conflicts(self, obj):
+        return BatchConflictSerializer(obj.conflicts.all(), many=True).data
+
+
+class BatchConflictSerializer(serializers.ModelSerializer):
+    idempotency_key = serializers.CharField(source="batch.idempotency_key",
+                                            read_only=True)
+    campaign_code = serializers.CharField(source="batch.campaign.code",
+                                          read_only=True)
+    field_number = serializers.SerializerMethodField()
+    plot = serializers.SerializerMethodField()
+
+    class Meta:
+        model = BatchConflict
+        fields = [
+            "id", "batch", "idempotency_key", "campaign_code",
+            "audit_row", "field_number", "plot",
+            "existing_measurement", "existing_batch", "detail",
+            "status", "resolution_note", "resolved_at", "created_at",
+        ]
+        read_only_fields = ["detail", "resolved_at"]
+
+    def get_field_number(self, obj):
+        return obj.audit_row.raw_payload.get("field_number")
+
+    def get_plot(self, obj):
+        return obj.audit_row.raw_payload.get("plot")
+
+
+class BatchConflictResolveSerializer(serializers.Serializer):
+    action = serializers.ChoiceField(
+        choices=["keep_existing", "accept_incoming", "accept_as_new"])
+    note = serializers.CharField(required=False, allow_blank=True)
+
+
+class MeasurementImportRowAuditSerializer(serializers.ModelSerializer):
+    """Queryable audit of every imported row, before and after apply."""
+
+    campaign_code = serializers.CharField(source="campaign.code",
+                                          read_only=True)
+    plot_code = serializers.CharField(source="plot.code", read_only=True)
+    idempotency_key = serializers.CharField(source="batch.idempotency_key",
+                                            read_only=True, default=None)
+
+    class Meta:
+        model = MeasurementImportRow
+        fields = [
+            "id", "campaign", "campaign_code", "plot", "plot_code",
+            "batch", "idempotency_key", "seq", "row_state", "accepted",
+            "rejection_reason", "raw_payload", "canonical",
+            "measurement", "created_at",
+        ]

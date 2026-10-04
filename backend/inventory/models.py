@@ -60,6 +60,59 @@ EQUATION_STATUS_CHOICES = [
     (EQUATION_RETIRED, "Retired"),
 ]
 
+# ---------------------------------------------------------------- batch sync
+# A field tablet uploads ONE survey as several batches (offline work,
+# flaky network). Each batch carries a client idempotency key and moves
+# through staged -> validated -> applied / blocked / failed.
+SURVEY_COLLECTING = "collecting"
+SURVEY_COMPLETE = "complete"
+SURVEY_STATUS_CHOICES = [
+    (SURVEY_COLLECTING, "Collecting batches"),
+    (SURVEY_COMPLETE, "Complete — all batches accounted for"),
+]
+
+BATCH_STAGED = "staged"          # rows received, validation pending/redoable
+BATCH_VALIDATED = "validated"    # all rows passed; apply is retryable
+BATCH_APPLIED = "applied"        # atomically written to measurements
+BATCH_BLOCKED = "blocked"        # overlaps applied data; manual handling
+BATCH_FAILED = "failed"          # row validation failed; resubmit new key
+BATCH_STATUS_CHOICES = [
+    (BATCH_STAGED, "Staged — received, not yet validated"),
+    (BATCH_VALIDATED, "Validated — ready to (re)apply"),
+    (BATCH_APPLIED, "Applied — measurements written atomically"),
+    (BATCH_BLOCKED, "Blocked — conflicting tree records, manual review"),
+    (BATCH_FAILED, "Failed — row validation errors, not applied"),
+]
+
+# Per-row audit states (MeasurementImportRow.row_state).
+ROW_STAGED = "staged"
+ROW_VALIDATED = "validated"
+ROW_APPLIED = "applied"
+ROW_REJECTED = "rejected"        # failed validation, never applied
+ROW_DUPLICATE = "duplicate"      # identical record already applied
+ROW_CONFLICTED = "conflicted"    # overlaps applied data, open BatchConflict
+ROW_DROPPED = "dropped"          # human kept the earlier record
+ROW_STATE_CHOICES = [
+    (ROW_STAGED, "Staged"),
+    (ROW_VALIDATED, "Validated"),
+    (ROW_APPLIED, "Applied"),
+    (ROW_REJECTED, "Rejected"),
+    (ROW_DUPLICATE, "Duplicate — identical record already applied"),
+    (ROW_CONFLICTED, "Conflicted — awaiting manual review"),
+    (ROW_DROPPED, "Dropped — earlier record kept by reviewer"),
+]
+
+BATCH_CONFLICT_OPEN = "open"
+BATCH_CONFLICT_KEEP = "keep_existing"      # earlier applied record wins
+BATCH_CONFLICT_ACCEPT = "accept_incoming"  # verified correction, overwrite
+BATCH_CONFLICT_AS_NEW = "accept_as_new"    # distinct individual, same label
+BATCH_CONFLICT_CHOICES = [
+    (BATCH_CONFLICT_OPEN, "Open — earlier data untouched"),
+    (BATCH_CONFLICT_KEEP, "Keep existing — incoming row dropped"),
+    (BATCH_CONFLICT_ACCEPT, "Accept incoming — verified correction"),
+    (BATCH_CONFLICT_AS_NEW, "Accept as new individual sharing the label"),
+]
+
 VERSION_DRAFT = "draft"
 VERSION_CONFIRMED = "confirmed"
 VERSION_SUPERSEDED = "superseded"
@@ -327,8 +380,109 @@ class IdentityConflict(models.Model):
         return f"{self.plot.code}/{self.field_number}: {self.status}"
 
 
+class Survey(models.Model):
+    """
+    One field survey of a campaign, uploaded as several batches.
+
+    A survey is ``collecting`` while tablets are still sending batches and
+    becomes ``complete`` either explicitly (coordinator finalises) or when
+    the client-declared ``expected_batches`` have all applied. Derived
+    products (identity scan, and through it mortality/ingrowth) are only
+    computed once the surveys of BOTH adjacent campaigns are complete —
+    a 2024 batch arriving before any 2019 data must not fabricate deaths
+    or ingrowth.
+    """
+
+    code = models.CharField(
+        max_length=64, unique=True,
+        help_text="Client-side survey identifier shared by its batches.",
+    )
+    campaign = models.ForeignKey(
+        Campaign, on_delete=models.PROTECT, related_name="surveys"
+    )
+    expected_batches = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Client-declared number of batches; reaching this many "
+                  "applied batches completes the survey automatically.",
+    )
+    status = models.CharField(
+        max_length=10, choices=SURVEY_STATUS_CHOICES,
+        default=SURVEY_COLLECTING,
+    )
+    finalized_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["campaign__measured_on", "code"]
+
+    def __str__(self):
+        return f"{self.code} [{self.status}]"
+
+
+class SurveyBatch(models.Model):
+    """
+    One uploaded batch of field rows with a client idempotency key.
+
+    * ``idempotency_key`` is unique: a retransmission with the SAME key and
+      the SAME content digest returns the stored receipt without any write;
+      the same key with a DIFFERENT digest is rejected.
+    * ``receipt`` stores the per-row outcome so a replayed submission can
+      be answered byte-identically.
+    * The batch only becomes ``applied`` when every row passed validation
+      and the measurements + identity scan were written in ONE atomic
+      transaction; an interrupted apply leaves the batch ``validated``
+      (retryable) with no partial measurements.
+    """
+
+    survey = models.ForeignKey(
+        Survey, on_delete=models.PROTECT, related_name="batches"
+    )
+    campaign = models.ForeignKey(
+        Campaign, on_delete=models.PROTECT, related_name="batches"
+    )
+    idempotency_key = models.CharField(max_length=80, unique=True)
+    content_digest = models.CharField(
+        max_length=64,
+        help_text="SHA-256 over the canonical row payload.",
+    )
+    status = models.CharField(
+        max_length=10, choices=BATCH_STATUS_CHOICES, default=BATCH_STAGED
+    )
+    row_count = models.PositiveIntegerField(default=0)
+    client_meta = models.JSONField(
+        default=dict, blank=True,
+        help_text="Optional device/crew metadata supplied by the tablet.",
+    )
+    receipt = models.JSONField(
+        null=True, blank=True,
+        help_text="Stored per-row receipt returned for replays.",
+    )
+    error = models.CharField(
+        max_length=300, blank=True,
+        help_text="Last failure/interruption note (state stays retryable).",
+    )
+    attempt_count = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"batch {self.idempotency_key} [{self.status}]"
+
+
 class MeasurementImportRow(models.Model):
-    """Audit trail for raw imported rows, including rejected ones."""
+    """
+    Audit trail for raw imported rows, including rejected ones.
+
+    Rows of a batch are written at STAGING time (before any measurement
+    exists) and transition staged -> validated -> applied / rejected /
+    duplicate / conflicted / dropped, so the audit is queryable before and
+    after the batch is applied. Legacy direct imports (batch=NULL) are
+    recorded as applied/rejected immediately.
+    """
 
     campaign = models.ForeignKey(
         Campaign, on_delete=models.PROTECT, related_name="import_rows"
@@ -340,6 +494,110 @@ class MeasurementImportRow(models.Model):
     accepted = models.BooleanField()
     rejection_reason = models.CharField(max_length=300, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+    batch = models.ForeignKey(
+        SurveyBatch, on_delete=models.CASCADE,
+        null=True, blank=True, related_name="audit_rows",
+    )
+    seq = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text="Row index within the submitting batch.",
+    )
+    row_state = models.CharField(
+        max_length=12, choices=ROW_STATE_CHOICES, default=ROW_APPLIED
+    )
+    canonical = models.JSONField(
+        null=True, blank=True,
+        help_text="Canonical (unit-converted) content used for duplicate "
+                  "and conflict detection.",
+    )
+    measurement = models.ForeignKey(
+        "TreeMeasurement", on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="import_rows",
+        help_text="Measurement written when this row was applied.",
+    )
+
+    class Meta:
+        ordering = ["id"]
+
+
+class BatchConflict(models.Model):
+    """
+    A batch row that contradicts an already-APPLIED measurement of the
+    same campaign / plot / field number (or same tracked tree).
+
+    The earlier applied data is NEVER overwritten automatically: the
+    batch is blocked until a human picks keep_existing / accept_incoming
+    / accept_as_new, after which the batch can be re-applied.
+    """
+
+    batch = models.ForeignKey(
+        SurveyBatch, on_delete=models.CASCADE, related_name="conflicts"
+    )
+    audit_row = models.ForeignKey(
+        MeasurementImportRow, on_delete=models.PROTECT,
+        related_name="batch_conflicts",
+    )
+    existing_measurement = models.ForeignKey(
+        "TreeMeasurement", on_delete=models.PROTECT,
+        related_name="batch_conflicts",
+    )
+    existing_batch = models.ForeignKey(
+        SurveyBatch, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name="conflicts_against",
+        help_text="Batch that originally applied the existing record.",
+    )
+    detail = models.JSONField(
+        default=dict,
+        help_text="Canonical incoming vs existing content for review.",
+    )
+    status = models.CharField(
+        max_length=16, choices=BATCH_CONFLICT_CHOICES,
+        default=BATCH_CONFLICT_OPEN,
+    )
+    resolution_note = models.CharField(max_length=240, blank=True)
+    resolved_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [("batch", "audit_row")]
+        ordering = ["batch_id", "id"]
+
+    def __str__(self):
+        return (f"batch#{self.batch_id} row {self.audit_row_id}: "
+                f"{self.status}")
+
+
+class SurveyScan(models.Model):
+    """
+    Record of an identity-conflict scan between two adjacent campaigns.
+
+    Written at most once per campaign pair per new applied data: the scan
+    runs when both sides' survey data is complete, and re-runs only if
+    newer batches were applied since the last scan. Identity conflicts
+    themselves are upserted, so a retry never creates doubles.
+    """
+
+    t1_campaign = models.ForeignKey(
+        Campaign, on_delete=models.PROTECT, related_name="scans_as_t1"
+    )
+    t2_campaign = models.ForeignKey(
+        Campaign, on_delete=models.PROTECT, related_name="scans_as_t2"
+    )
+    scanned_at = models.DateTimeField()
+    n_conflicts = models.PositiveIntegerField(default=0)
+    trigger = models.CharField(
+        max_length=64, blank=True,
+        help_text="Survey code (or caller) that triggered this scan.",
+    )
+
+    class Meta:
+        unique_together = [("t1_campaign", "t2_campaign")]
+        ordering = ["t1_campaign__measured_on"]
+
+    def __str__(self):
+        return (f"scan {self.t1_campaign.code}↔{self.t2_campaign.code} "
+                f"@ {self.scanned_at:%Y-%m-%d %H:%M}")
 
 
 class EstimateVersion(models.Model):

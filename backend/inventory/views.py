@@ -5,15 +5,22 @@ GET  /plots/                        plot positions + boundaries (React map)
 GET  /trees/?campaign=CODE          individuals and remeasurement status
 GET  /conflicts/                    same-number position contradictions
 POST /conflicts/{id}/resolve/       human verification only
-POST /imports/                      ingest a campaign's field rows
+POST /imports/                      ingest a campaign's field rows (legacy)
+POST /batches/                      submit one survey batch (idempotent)
+GET  /batches/                      upload progress per batch
+GET  /batches/{id}/                 batch detail + per-row receipt
+POST /batches/{id}/apply/           continue/apply a validated|blocked batch
+GET  /surveys/                      survey collection progress
+POST /surveys/{id}/finalize/        mark a survey complete (triggers scan)
+GET  /batch-conflicts/              overlapping tree records, manual queue
+POST /batch-conflicts/{id}/resolve/ keep existing / accept incoming / as new
+GET  /import-rows/                  row-level audit, before and after apply
 POST /estimates/                    run (or rerun) a DRAFT estimate
 POST /estimates/{id}/confirm/       freeze forever; locks equations
 GET  /estimates/{id}/               frozen result with provenance
 """
-import hashlib
-
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -21,31 +28,56 @@ from rest_framework.response import Response
 
 from inventory.models import (
     AllometricEquation,
+    BATCH_APPLIED,
+    BATCH_BLOCKED,
+    BATCH_CONFLICT_OPEN,
+    BATCH_FAILED,
+    BatchConflict,
     Campaign,
     CONFLICT_DISTINCT,
     CONFLICT_OPEN,
     CONFLICT_RENUMBER,
     EstimateVersion,
     IdentityConflict,
+    MeasurementImportRow,
     Plot,
     Species,
     Stratum,
+    Survey,
+    SurveyBatch,
     Tree,
     TreeMeasurement,
     VERSION_CONFIRMED,
 )
 from inventory.serializers import (
+    BatchConflictResolveSerializer,
+    BatchConflictSerializer,
+    BatchSubmitSerializer,
     CampaignSerializer,
     ConflictResolveSerializer,
     ConflictSerializer,
     EquationSerializer,
     EstimateVersionSerializer,
+    MeasurementImportRowAuditSerializer,
     MeasurementImportSerializer,
     MeasurementSerializer,
     PlotSerializer,
     SpeciesSerializer,
     StratumSerializer,
+    SurveyBatchDetailSerializer,
+    SurveyBatchSerializer,
+    SurveySerializer,
     TreeSerializer,
+)
+from inventory.services.batches import (
+    BatchStateError,
+    apply_batch,
+    batch_content_digest,
+    build_receipt,
+    estimate_prerequisites,
+    finalize_survey,
+    find_replay,
+    submit_batch,
 )
 from inventory.services.conflicts import scan_conflicts
 from inventory.services.estimator import (
@@ -178,6 +210,215 @@ class ImportViewSet(viewsets.ViewSet):
                         else status.HTTP_200_OK)
 
 
+class SurveyViewSet(viewsets.ReadOnlyModelViewSet):
+    """Upload progress per survey (batches applied / expected)."""
+
+    serializer_class = SurveySerializer
+
+    def get_queryset(self):
+        qs = Survey.objects.select_related("campaign").prefetch_related(
+            "batches")
+        campaign = self.request.query_params.get("campaign")
+        if campaign:
+            qs = qs.filter(campaign__code=campaign)
+        state = self.request.query_params.get("status")
+        if state:
+            qs = qs.filter(status=state)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def finalize(self, request, pk=None):
+        """
+        Coordinator declares every batch of this survey accounted for.
+        Completing a survey triggers the identity scan against adjacent
+        campaigns whose survey data is also complete.
+        """
+        survey = self.get_object()
+        scan = finalize_survey(survey)
+        data = SurveySerializer(survey).data
+        data["scan"] = scan
+        return Response(data)
+
+
+class BatchViewSet(viewsets.ViewSet):
+    """
+    Resumable survey batch sync.
+
+    create: idempotent submit — same key + same payload replays the
+    stored receipt without writing; same key + different payload is
+    rejected; overlapping tree records block the batch for manual review.
+    apply:  continue a validated/blocked batch (crash-safe, retryable).
+    """
+
+    def create(self, request):
+        ser = BatchSubmitSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        data = ser.validated_data
+        campaign = Campaign.objects.filter(code=data["campaign"]).first()
+        if campaign is None:
+            return Response({"detail": "unknown campaign"},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        digest = batch_content_digest(campaign.code, data["survey"],
+                                      data["rows"])
+        existing, replay = find_replay(data["idempotency_key"], digest)
+        if existing is not None:
+            if replay:
+                # network-recovery retransmission: original receipt,
+                # zero writes.
+                receipt = existing.receipt or build_receipt(existing)
+                return Response({**receipt, "replay": True},
+                                status=status.HTTP_200_OK)
+            return Response(
+                {"detail": "idempotency key already used with a DIFFERENT "
+                           "payload; rejected without writing. Use a new "
+                           "key for corrected data.",
+                 "batch_id": existing.id,
+                 "stored_digest": existing.content_digest,
+                 "received_digest": digest},
+                status=status.HTTP_409_CONFLICT)
+
+        try:
+            receipt = submit_batch(
+                campaign, data["survey"], data["idempotency_key"],
+                data["rows"],
+                expected_batches=data.get("expected_batches"),
+                client_meta=data.get("client_meta"),
+                area_tolerance=settings.PLOT_AREA_TOLERANCE,
+            )
+        except BatchStateError as exc:
+            return Response({"detail": str(exc)},
+                            status=status.HTTP_409_CONFLICT)
+        except IntegrityError:
+            # concurrent submit raced us on the unique idempotency key:
+            # answer from the stored batch exactly like a replay check.
+            batch = SurveyBatch.objects.get(
+                idempotency_key=data["idempotency_key"])
+            if batch.content_digest == digest:
+                receipt = batch.receipt or build_receipt(batch)
+                return Response({**receipt, "replay": True},
+                                status=status.HTTP_200_OK)
+            return Response(
+                {"detail": "idempotency key already used with a DIFFERENT "
+                           "payload; rejected without writing."},
+                status=status.HTTP_409_CONFLICT)
+
+        batch_status = receipt["status"]
+        if batch_status == BATCH_APPLIED:
+            code = status.HTTP_201_CREATED
+        elif batch_status == BATCH_BLOCKED:
+            code = status.HTTP_409_CONFLICT
+        elif batch_status == BATCH_FAILED:
+            code = status.HTTP_422_UNPROCESSABLE_ENTITY
+        else:
+            code = status.HTTP_202_ACCEPTED
+        return Response(receipt, status=code)
+
+    def list(self, request):
+        qs = (SurveyBatch.objects
+              .select_related("survey", "campaign").order_by("-created_at"))
+        survey = request.query_params.get("survey")
+        if survey:
+            qs = qs.filter(survey__code=survey)
+        campaign = request.query_params.get("campaign")
+        if campaign:
+            qs = qs.filter(campaign__code=campaign)
+        state = request.query_params.get("status")
+        if state:
+            qs = qs.filter(status=state)
+        return Response(SurveyBatchSerializer(qs, many=True).data)
+
+    def retrieve(self, request, pk=None):
+        from django.shortcuts import get_object_or_404
+        batch = get_object_or_404(
+            SurveyBatch.objects.select_related("survey", "campaign")
+                               .prefetch_related("conflicts"), pk=pk)
+        return Response(SurveyBatchDetailSerializer(batch).data)
+
+    @action(detail=True, methods=["post"])
+    def apply(self, request, pk=None):
+        """Continue applying a validated/blocked batch. Idempotent."""
+        from django.shortcuts import get_object_or_404
+        batch = get_object_or_404(SurveyBatch, pk=pk)
+        try:
+            receipt = apply_batch(
+                batch.pk, area_tolerance=settings.PLOT_AREA_TOLERANCE)
+        except BatchStateError as exc:
+            return Response(
+                {"detail": str(exc),
+                 "receipt": build_receipt(batch)},
+                status=status.HTTP_409_CONFLICT)
+        except Exception as exc:  # interrupted mid-transaction: rolled back
+            batch.refresh_from_db()
+            return Response(
+                {"detail": f"apply interrupted and rolled back; safe to "
+                           f"retry. ({exc})",
+                 "receipt": build_receipt(batch)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        code = (status.HTTP_200_OK if receipt["status"] == BATCH_APPLIED
+                else status.HTTP_409_CONFLICT)
+        return Response(receipt, status=code)
+
+
+class BatchConflictViewSet(viewsets.ReadOnlyModelViewSet):
+    """Overlapping tree records awaiting manual handling."""
+
+    serializer_class = BatchConflictSerializer
+
+    def get_queryset(self):
+        qs = (BatchConflict.objects
+              .select_related("batch", "batch__campaign", "audit_row",
+                              "existing_measurement"))
+        state = self.request.query_params.get("status")
+        if state:
+            qs = qs.filter(status=state)
+        batch = self.request.query_params.get("batch")
+        if batch:
+            qs = qs.filter(batch_id=batch)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def resolve(self, request, pk=None):
+        """
+        Human decision on an overlap. The earlier applied record is kept
+        unless the reviewer explicitly accepts the incoming one; nothing
+        is overwritten automatically. Re-apply the batch afterwards.
+        """
+        conflict = self.get_object()
+        ser = BatchConflictResolveSerializer(data=request.data)
+        ser.is_valid(raise_exception=True)
+        if conflict.status != BATCH_CONFLICT_OPEN:
+            return Response(
+                {"detail": f"conflict already resolved as "
+                           f"{conflict.status}."},
+                status=status.HTTP_409_CONFLICT)
+        conflict.status = ser.validated_data["action"]
+        conflict.resolution_note = ser.validated_data.get("note", "")
+        conflict.resolved_at = timezone.now()
+        conflict.save()
+        return Response(BatchConflictSerializer(conflict).data)
+
+
+class ImportRowViewSet(viewsets.ReadOnlyModelViewSet):
+    """Row-level import audit, queryable before and after batch apply."""
+
+    serializer_class = MeasurementImportRowAuditSerializer
+
+    def get_queryset(self):
+        qs = (MeasurementImportRow.objects
+              .select_related("campaign", "plot", "batch"))
+        params = self.request.query_params
+        if params.get("campaign"):
+            qs = qs.filter(campaign__code=params["campaign"])
+        if params.get("batch"):
+            qs = qs.filter(batch_id=params["batch"])
+        if params.get("state"):
+            qs = qs.filter(row_state=params["state"])
+        if params.get("accepted") in ("true", "false"):
+            qs = qs.filter(accepted=params["accepted"] == "true")
+        return qs
+
+
 class EstimateViewSet(viewsets.ViewSet):
     def list(self, request):
         qs = EstimateVersion.objects.all().order_by("-created_at")
@@ -203,6 +444,13 @@ class EstimateViewSet(viewsets.ViewSet):
             return Response(
                 {"detail": "need t1 earlier than t2 campaign codes"},
                 status=status.HTTP_400_BAD_REQUEST)
+        # Mortality/ingrowth are derived only once adjacent survey data is
+        # complete: a half-arrived survey (e.g. 2024 batches present, 2019
+        # still offline) must not fabricate deaths or recruits.
+        problems = estimate_prerequisites(t1, t2)
+        if problems:
+            return Response({"detail": problems},
+                            status=status.HTTP_409_CONFLICT)
         eq_ids = request.data.get("equation_ids", [])
         equations_qs = AllometricEquation.objects.filter(
             id__in=eq_ids

@@ -99,6 +99,30 @@ pre { background: #f2f5f2; border-radius: 6px; padding: 8px; font-size: 11px;
   border-radius: 10px; padding: 2px 9px; font-size: 11px; margin: 2px 4px 2px 0; }
 .assumptions { font-size: 12px; color: #37473d; padding-left: 18px; }
 .assumptions li { margin-bottom: 5px; }
+
+/* ---- survey batch sync ---- */
+.batch-status { display: inline-block; border-radius: 10px; padding: 2px 9px;
+  font-size: 11px; font-weight: 600; }
+.batch-status.st-applied, .batch-status.st-complete { background: #e7f6e9;
+  color: var(--green); }
+.batch-status.st-blocked { background: #fdf3dd; color: #9a6b00; }
+.batch-status.st-failed { background: #fdecec; color: var(--red); }
+.batch-status.st-validated, .batch-status.st-staged,
+.batch-status.st-collecting { background: #e8f0fc; color: #1a4f9c; }
+tr.batch-row.st-blocked { background: #fff8ec; }
+tr.batch-row.st-failed { background: #fdecec; }
+tr.st-rejected { background: #fdecec; }
+tr.st-duplicate, tr.st-dropped { background: #f0f0f0; color: #666; }
+tr.st-conflicted { background: #fff8ec; }
+.submit-grid { display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 10px; margin-bottom: 8px; font-size: 13px; }
+.submit-grid label { display: flex; flex-direction: column; gap: 4px;
+  color: var(--muted); }
+.submit-grid input, .submit-grid select { padding: 6px 8px;
+  border: 1px solid var(--line); border-radius: 6px; font-size: 13px; }
+textarea { width: 100%; font-family: ui-monospace, monospace; font-size: 12px;
+  border: 1px solid var(--line); border-radius: 6px; padding: 8px;
+  margin: 6px 0; }
 footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
 @media (max-width: 900px) {
   .detail-grid, .two-col { grid-template-columns: 1fr; }

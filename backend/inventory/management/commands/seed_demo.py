@@ -30,7 +30,6 @@ from inventory.models import (
     Species,
     Stratum,
 )
-from inventory.services.conflicts import scan_conflicts
 from inventory.services.ingest import import_campaign_rows, verify_plot_area
 
 
@@ -163,10 +162,12 @@ class Command(BaseCommand):
     @transaction.atomic
     def handle(self, *args, **options):
         from inventory.models import (
-            EstimateVersion, IdentityConflict, MeasurementImportRow,
+            BatchConflict, EstimateVersion, IdentityConflict,
+            MeasurementImportRow, Survey, SurveyBatch, SurveyScan,
             Tree, TreeMeasurement,
         )
-        models = [EstimateVersion, IdentityConflict, MeasurementImportRow,
+        models = [EstimateVersion, IdentityConflict, BatchConflict,
+                  SurveyScan, MeasurementImportRow, SurveyBatch, Survey,
                   TreeMeasurement, Tree, Plot, Campaign,
                   AllometricEquation, Species, Stratum]
         for m in models:
@@ -261,19 +262,14 @@ class Command(BaseCommand):
                            else "")))
             return rows
 
-        t1_rows, t2_rows = [], []
+        t1_rows = []
+        t2_batches = {}  # plot code -> 2024 rows (one tablet batch per plot)
         for code in PLOTS:
             t1_rows.extend(rows_for(code, "2019"))
             r2 = rows_for(code, "2024")
             if code == "P01":
                 r2.extend(P01_CONFLICT_T2)
-            if code == "P02":
-                r2.extend(BAD_ROWS_T2[:2])
-            if code == "P03":
-                r2.extend(BAD_ROWS_T2[2:3])
-            if code == "P01":
-                r2.extend(BAD_ROWS_T2[3:4])
-            t2_rows.extend(r2)
+            t2_batches[code] = r2
 
         r1 = import_campaign_rows(t1, t1_rows,
                                   settings.PLOT_AREA_TOLERANCE)
@@ -287,21 +283,47 @@ class Command(BaseCommand):
         old007.current_field_number = "017"
         old007.save(update_fields=["current_field_number"])
 
-        r2 = import_campaign_rows(t2, t2_rows,
-                                  settings.PLOT_AREA_TOLERANCE)
+        # The 2024 survey arrives as field-tablet batches: one batch per
+        # plot plus a "corrections" batch holding the four bad rows. The
+        # corrections batch MUST fail as a whole (all-or-nothing apply);
+        # the survey is then finalised explicitly, which triggers the
+        # identity scan against the (legacy-imported) 2019 campaign.
+        from inventory.services.batches import finalize_survey, submit_batch
+        survey_code = "2024-field"
+        n_declared = len(PLOTS) + 1
+        for code in PLOTS:
+            receipt = submit_batch(
+                t2, survey_code, f"seed-2024-{code}", t2_batches[code],
+                expected_batches=n_declared,
+                client_meta={"device": "seed", "plot": code},
+                area_tolerance=settings.PLOT_AREA_TOLERANCE)
+            self.stdout.write(
+                f"batch 2024/{code}: {receipt['status']} "
+                f"applied={receipt['n_applied']} "
+                f"duplicates={receipt['n_duplicates']}")
+        bad = submit_batch(
+            t2, survey_code, "seed-2024-corrections", BAD_ROWS_T2,
+            client_meta={"device": "seed", "note": "field-desk corrections"},
+            area_tolerance=settings.PLOT_AREA_TOLERANCE)
+        self.stdout.write(
+            f"batch 2024/corrections: {bad['status']} "
+            f"rejected={bad['n_rejected']} (whole batch held back)")
+        for row in bad["rows"]:
+            if row["state"] == "rejected":
+                self.stdout.write(
+                    f"  REJECTED {row['plot']}/{row['field_number']}: "
+                    f"{row['reason']}")
+
+        scan = finalize_survey(Survey.objects.get(code=survey_code))
+        self.stdout.write(f"survey {survey_code} finalised; scan: {scan}")
+
         self.stdout.write(
             f"t1 accepted={r1['n_accepted']} rejected={r1['n_rejected']}")
-        self.stdout.write(
-            f"t2 accepted={r2['n_accepted']} rejected={r2['n_rejected']}")
-        for bad in r2["rejected"]:
-            self.stdout.write("  REJECTED: " + bad["reason"])
-
-        found = scan_conflicts(t1, t2)
-        self.stdout.write(f"identity conflicts found: {len(found)}")
-        for f in found:
+        n_conf = IdentityConflict.objects.count()
+        self.stdout.write(f"identity conflicts found: {n_conf}")
+        for c in IdentityConflict.objects.select_related("plot"):
             self.stdout.write(
-                f"  {f['plot']}/{f['field_number']} -> "
-                f"{f.get('t2_field_number')} d={f['distance_m']}m "
-                f"[{f['hint']}]")
+                f"  {c.plot.code}/{c.field_number} d={c.distance_m}m "
+                f"[{c.resolution_note}]")
 
         self.stdout.write(self.style.SUCCESS("seed complete"))
